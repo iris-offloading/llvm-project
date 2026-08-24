@@ -85,6 +85,39 @@ Verified by removing one ingredient at a time:
   non-`inline` case passes only because nothing forces the body into the
   importer there).
 
+## Crash on a release (no-assertions) clang
+
+clang 24.0.0git, `-DLLVM_ENABLE_ASSERTIONS=OFF`, `--target=x86_64-pc-windows-msvc`
+— the reporter's signature, with `make_closure` in the place of
+`std::ranges::_Tuple_for_each_closure`:
+
+```
+4. lib.cppm:3:39: LLVM IR generation of declaration 'make_closure'
+5. lib.cppm:3:39: Mangling declaration 'make_closure'
+ #4 MicrosoftCXXNameMangler::mangleUnqualifiedName(GlobalDecl, DeclarationName)
+ #5 MicrosoftCXXNameMangler::mangleType(const RecordType *, Qualifiers, SourceRange)
+ #6 MicrosoftCXXNameMangler::mangleTemplateInstantiationName(...)
+ #7 MicrosoftCXXNameMangler::mangleUnqualifiedName(GlobalDecl, DeclarationName)
+ #8 MicrosoftCXXNameMangler::mangle(GlobalDecl, StringRef)
+ #9 MicrosoftMangleContextImpl::mangleCXXName(GlobalDecl, raw_ostream &)
+#10 getMangledNameImpl(CodeGenModule &, GlobalDecl, const NamedDecl *, bool)
+#11 CodeGenModule::getMangledName(GlobalDecl)
+#12 CodeGenModule::EmitGlobal(GlobalDecl)
+#13 CodeGenModule::EmitTopLevelDecl(Decl *)
+#16 ASTReader::PassInterestingDeclsToConsumer()
+#17 ASTReader::FinishedDeserializing()
+#18 ASTReader::GetExternalDeclStmt(uint64_t)
+#19 FunctionDecl::getBody() const
+#20 Sema::MarkFunctionReferenced(SourceLocation, FunctionDecl *, bool)
+...
+#26 Sema::BuildOverloadedCallExpr(...)                 <- the `++it` in Mod's test()
+```
+
+Mangling `make_closure<L>` mangles its template argument `L`, the closure
+type, whose `CXXRecordDecl` is the one with the bogus definition data: the
+`Record->isLambda()` branch of `mangleUnqualifiedName` is not taken, so it
+falls into the unnamed-tag path and dereferences null.
+
 ## Diagnosis
 
 Assertions build of clang 24.0.0git (`clang/lib/Serialization/ASTReaderDecl.cpp:2106`):
@@ -126,11 +159,11 @@ clang/lib/Serialization/ASTReader.cpp:10803:
 Assertion `PendingFakeDefinitionData.empty() && "faked up a class definition but never saw the real one"' failed.
 ```
 
-In a release build (no assertions) nothing stops the half-initialised closure
-type from reaching IR generation, which is where the reporter's
-`0xC0000005` / `SIGSEGV` inside "Mangling declaration ..." comes from.  Same
-family as the already-fixed #120277 ("undeduced type in IR-generation") — the
-deduced return type of the `*_closure` template is only filled in by
-`ASTContext::adjustDeducedFunctionResultType` running out of
-`ASTReader::FinishedDeserializing`, which can re-enter
-`PassInterestingDeclsToConsumer` and hand the decl to CodeGen too early.
+In a release build nothing stops the half-initialised closure type from
+reaching IR generation, which is the `0xC0000005` / `SIGSEGV` inside
+"Mangling declaration ..." shown above.  It gets there because
+`ASTReader::FinishedDeserializing` calls `PassInterestingDeclsToConsumer`
+while still inside the `Sema::MarkFunctionReferenced` that started the
+deserialization, so `make_closure<L>` is handed to CodeGen in the same nested
+scope that produced the faked-up definition.  Same family as the already-fixed
+#120277 ("undeduced type in IR-generation").
