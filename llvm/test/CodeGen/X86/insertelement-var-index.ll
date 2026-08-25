@@ -2378,3 +2378,178 @@ define i32 @PR44139(ptr %p) {
   %B9 = udiv i32 %elt, %B
   ret i32 %B9
 }
+
+; The index is the low byte of a 64-bit value whose upper half is non-zero.
+; Narrowing it to 32 bits is what keeps the index register in range, so the
+; instruction that does the narrowing must not be dropped as a redundant mask:
+; the address must not be scaled by the raw 64-bit value.
+define <4 x i32> @index_from_upper_nonzero_i64(i32 %x) nounwind {
+; SSE2-LABEL: index_from_upper_nonzero_i64:
+; SSE2:       # %bb.0:
+; SSE2-NEXT:    andl $1, %edi
+; SSE2-NEXT:    movd %edi, %xmm0
+; SSE2-NEXT:    movaps {{.*#+}} xmm1 = [u,1,1,1]
+; SSE2-NEXT:    movss {{.*#+}} xmm1 = xmm0[0],xmm1[1,2,3]
+; SSE2-NEXT:    movq %xmm1, %rax
+; SSE2-NEXT:    xorps %xmm0, %xmm0
+; SSE2-NEXT:    movaps %xmm0, -{{[0-9]+}}(%rsp)
+; SSE2-NEXT:    andl $3, %eax
+; SSE2-NEXT:    movl $0, -24(%rsp,%rax,4)
+; SSE2-NEXT:    movaps -{{[0-9]+}}(%rsp), %xmm0
+; SSE2-NEXT:    retq
+;
+; SSE41-LABEL: index_from_upper_nonzero_i64:
+; SSE41:       # %bb.0:
+; SSE41-NEXT:    andl $1, %edi
+; SSE41-NEXT:    pmovsxbd {{.*#+}} xmm0 = [1,1,1,1]
+; SSE41-NEXT:    pinsrd $0, %edi, %xmm0
+; SSE41-NEXT:    movq %xmm0, %rax
+; SSE41-NEXT:    pxor %xmm0, %xmm0
+; SSE41-NEXT:    movdqa %xmm0, -{{[0-9]+}}(%rsp)
+; SSE41-NEXT:    movl %eax, %eax
+; SSE41-NEXT:    movl $0, -24(%rsp,%rax,4)
+; SSE41-NEXT:    movaps -{{[0-9]+}}(%rsp), %xmm0
+; SSE41-NEXT:    retq
+;
+; AVX1-LABEL: index_from_upper_nonzero_i64:
+; AVX1:       # %bb.0:
+; AVX1-NEXT:    andl $1, %edi
+; AVX1-NEXT:    vbroadcastss {{.*#+}} xmm0 = [1,1,1,1]
+; AVX1-NEXT:    vpinsrd $0, %edi, %xmm0, %xmm0
+; AVX1-NEXT:    vmovq %xmm0, %rax
+; AVX1-NEXT:    vpxor %xmm0, %xmm0, %xmm0
+; AVX1-NEXT:    vmovdqa %xmm0, -{{[0-9]+}}(%rsp)
+; AVX1-NEXT:    movl %eax, %eax
+; AVX1-NEXT:    movl $0, -24(%rsp,%rax,4)
+; AVX1-NEXT:    vmovaps -{{[0-9]+}}(%rsp), %xmm0
+; AVX1-NEXT:    retq
+;
+; AVX2-LABEL: index_from_upper_nonzero_i64:
+; AVX2:       # %bb.0:
+; AVX2-NEXT:    andl $1, %edi
+; AVX2-NEXT:    vpbroadcastd {{.*#+}} xmm0 = [1,1,1,1]
+; AVX2-NEXT:    vpinsrd $0, %edi, %xmm0, %xmm0
+; AVX2-NEXT:    vmovq %xmm0, %rax
+; AVX2-NEXT:    vpxor %xmm0, %xmm0, %xmm0
+; AVX2-NEXT:    vmovdqa %xmm0, -{{[0-9]+}}(%rsp)
+; AVX2-NEXT:    movl %eax, %eax
+; AVX2-NEXT:    movl $0, -24(%rsp,%rax,4)
+; AVX2-NEXT:    vmovaps -{{[0-9]+}}(%rsp), %xmm0
+; AVX2-NEXT:    retq
+;
+; AVX512-LABEL: index_from_upper_nonzero_i64:
+; AVX512:       # %bb.0:
+; AVX512-NEXT:    vxorps %xmm0, %xmm0, %xmm0
+; AVX512-NEXT:    retq
+;
+; X86AVX2-LABEL: index_from_upper_nonzero_i64:
+; X86AVX2:       # %bb.0:
+; X86AVX2-NEXT:    pushl %ebp
+; X86AVX2-NEXT:    movl %esp, %ebp
+; X86AVX2-NEXT:    andl $-16, %esp
+; X86AVX2-NEXT:    subl $32, %esp
+; X86AVX2-NEXT:    movl 8(%ebp), %eax
+; X86AVX2-NEXT:    andl $1, %eax
+; X86AVX2-NEXT:    vxorps %xmm0, %xmm0, %xmm0
+; X86AVX2-NEXT:    vmovaps %xmm0, (%esp)
+; X86AVX2-NEXT:    movl $0, (%esp,%eax,4)
+; X86AVX2-NEXT:    vmovaps (%esp), %xmm0
+; X86AVX2-NEXT:    movl %ebp, %esp
+; X86AVX2-NEXT:    popl %ebp
+; X86AVX2-NEXT:    retl
+  %a = and i32 %x, 1
+  %c = call i32 @llvm.ctpop.i32(i32 %a)
+  %v = insertelement <4 x i32> splat (i32 1), i32 %c, i64 0
+  %b = bitcast <4 x i32> %v to <2 x i64>
+  %e = extractelement <2 x i64> %b, i64 0
+  %idx = trunc i64 %e to i8
+  %r = insertelement <4 x i32> zeroinitializer, i32 0, i8 %idx
+  ret <4 x i32> %r
+}
+
+; Same as above, but the value feeding the index clamp is a frozen truncate;
+; freeze is also excluded from the def32 contract, so the clamp must survive.
+define <4 x i32> @index_from_upper_nonzero_i64_freeze(i32 %x) nounwind {
+; SSE2-LABEL: index_from_upper_nonzero_i64_freeze:
+; SSE2:       # %bb.0:
+; SSE2-NEXT:    andl $1, %edi
+; SSE2-NEXT:    movd %edi, %xmm0
+; SSE2-NEXT:    movaps {{.*#+}} xmm1 = [u,1,1,1]
+; SSE2-NEXT:    movss {{.*#+}} xmm1 = xmm0[0],xmm1[1,2,3]
+; SSE2-NEXT:    movq %xmm1, %rax
+; SSE2-NEXT:    xorps %xmm0, %xmm0
+; SSE2-NEXT:    movaps %xmm0, -{{[0-9]+}}(%rsp)
+; SSE2-NEXT:    andl $3, %eax
+; SSE2-NEXT:    movl $0, -24(%rsp,%rax,4)
+; SSE2-NEXT:    movaps -{{[0-9]+}}(%rsp), %xmm0
+; SSE2-NEXT:    retq
+;
+; SSE41-LABEL: index_from_upper_nonzero_i64_freeze:
+; SSE41:       # %bb.0:
+; SSE41-NEXT:    andl $1, %edi
+; SSE41-NEXT:    pmovsxbd {{.*#+}} xmm0 = [1,1,1,1]
+; SSE41-NEXT:    pinsrd $0, %edi, %xmm0
+; SSE41-NEXT:    movq %xmm0, %rax
+; SSE41-NEXT:    pxor %xmm0, %xmm0
+; SSE41-NEXT:    movdqa %xmm0, -{{[0-9]+}}(%rsp)
+; SSE41-NEXT:    movl %eax, %eax
+; SSE41-NEXT:    movl $0, -24(%rsp,%rax,4)
+; SSE41-NEXT:    movaps -{{[0-9]+}}(%rsp), %xmm0
+; SSE41-NEXT:    retq
+;
+; AVX1-LABEL: index_from_upper_nonzero_i64_freeze:
+; AVX1:       # %bb.0:
+; AVX1-NEXT:    andl $1, %edi
+; AVX1-NEXT:    vbroadcastss {{.*#+}} xmm0 = [1,1,1,1]
+; AVX1-NEXT:    vpinsrd $0, %edi, %xmm0, %xmm0
+; AVX1-NEXT:    vmovq %xmm0, %rax
+; AVX1-NEXT:    vpxor %xmm0, %xmm0, %xmm0
+; AVX1-NEXT:    vmovdqa %xmm0, -{{[0-9]+}}(%rsp)
+; AVX1-NEXT:    movl %eax, %eax
+; AVX1-NEXT:    movl $0, -24(%rsp,%rax,4)
+; AVX1-NEXT:    vmovaps -{{[0-9]+}}(%rsp), %xmm0
+; AVX1-NEXT:    retq
+;
+; AVX2-LABEL: index_from_upper_nonzero_i64_freeze:
+; AVX2:       # %bb.0:
+; AVX2-NEXT:    andl $1, %edi
+; AVX2-NEXT:    vpbroadcastd {{.*#+}} xmm0 = [1,1,1,1]
+; AVX2-NEXT:    vpinsrd $0, %edi, %xmm0, %xmm0
+; AVX2-NEXT:    vmovq %xmm0, %rax
+; AVX2-NEXT:    vpxor %xmm0, %xmm0, %xmm0
+; AVX2-NEXT:    vmovdqa %xmm0, -{{[0-9]+}}(%rsp)
+; AVX2-NEXT:    movl %eax, %eax
+; AVX2-NEXT:    movl $0, -24(%rsp,%rax,4)
+; AVX2-NEXT:    vmovaps -{{[0-9]+}}(%rsp), %xmm0
+; AVX2-NEXT:    retq
+;
+; AVX512-LABEL: index_from_upper_nonzero_i64_freeze:
+; AVX512:       # %bb.0:
+; AVX512-NEXT:    vxorps %xmm0, %xmm0, %xmm0
+; AVX512-NEXT:    retq
+;
+; X86AVX2-LABEL: index_from_upper_nonzero_i64_freeze:
+; X86AVX2:       # %bb.0:
+; X86AVX2-NEXT:    pushl %ebp
+; X86AVX2-NEXT:    movl %esp, %ebp
+; X86AVX2-NEXT:    andl $-16, %esp
+; X86AVX2-NEXT:    subl $32, %esp
+; X86AVX2-NEXT:    movl 8(%ebp), %eax
+; X86AVX2-NEXT:    andl $1, %eax
+; X86AVX2-NEXT:    vxorps %xmm0, %xmm0, %xmm0
+; X86AVX2-NEXT:    vmovaps %xmm0, (%esp)
+; X86AVX2-NEXT:    movl $0, (%esp,%eax,4)
+; X86AVX2-NEXT:    vmovaps (%esp), %xmm0
+; X86AVX2-NEXT:    movl %ebp, %esp
+; X86AVX2-NEXT:    popl %ebp
+; X86AVX2-NEXT:    retl
+  %a = and i32 %x, 1
+  %c = call i32 @llvm.ctpop.i32(i32 %a)
+  %v = insertelement <4 x i32> splat (i32 1), i32 %c, i64 0
+  %b = bitcast <4 x i32> %v to <2 x i64>
+  %e = extractelement <2 x i64> %b, i64 0
+  %t = trunc i64 %e to i32
+  %f = freeze i32 %t
+  %r = insertelement <4 x i32> zeroinitializer, i32 0, i32 %f
+  ret <4 x i32> %r
+}

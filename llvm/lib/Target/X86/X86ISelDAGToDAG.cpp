@@ -1759,6 +1759,36 @@ void X86DAGToDAGISel::PostprocessISelDAG() {
     // Attempt to remove vectors moves that were inserted to zero upper bits.
     case TargetOpcode::SUBREG_TO_REG: {
       unsigned SubRegIdx = N->getConstantOperandVal(1);
+      if (SubRegIdx == X86::sub_32bit) {
+        // SUBREG_TO_REG asserts that the upper 32 bits of its result are
+        // zero. Patterns create it over a 32-bit instruction, which
+        // implicitly zeroes them (the def32 predicate), but transforms that
+        // run during selection can replace that source after the fact with a
+        // node carrying no such guarantee: shrinkAndImmediate dropping a
+        // redundant AND can leave SUBREG_TO_REG over the bare EXTRACT_SUBREG
+        // of a truncate, a CopyFromReg, or a freeze. Restore the guarantee
+        // with a real 32-bit move (matching what the zext-of-trunc pattern in
+        // X86InstrCompiler.td emits). Trust a copy from a physical register:
+        // those are created manually, right next to an instruction known to
+        // zero the upper bits (e.g. the 32-bit divides in the idivq-to-divl
+        // bypass).
+        SDValue Src = N->getOperand(0);
+        bool Trusted =
+            Src.isMachineOpcode()
+                ? Src.getMachineOpcode() > TargetOpcode::GENERIC_OP_END
+                : Src.getOpcode() == ISD::CopyFromReg &&
+                      cast<RegisterSDNode>(Src.getOperand(1))
+                          ->getReg()
+                          .isPhysical();
+        if (Src.getValueType() == MVT::i32 && !Trusted) {
+          SDValue Mov(
+              CurDAG->getMachineNode(X86::MOV32rr, SDLoc(N), MVT::i32, Src),
+              0);
+          CurDAG->UpdateNodeOperands(N, Mov, N->getOperand(1));
+          MadeChange = true;
+        }
+        continue;
+      }
       if (SubRegIdx != X86::sub_xmm && SubRegIdx != X86::sub_ymm)
         continue;
 
